@@ -68,6 +68,24 @@ std::string resultCodeToString(rclcpp_action::ResultCode result_code)
 
 using namespace std::placeholders;
 
+namespace
+{
+template<typename ActionT>
+void cancelChildGoal(
+  rclcpp_action::Client<ActionT> & client,
+  typename rclcpp_action::ClientGoalHandle<ActionT>::SharedPtr & child)
+{
+  if (!child) { return; }
+  try
+  {
+    client.async_cancel_goal(child);
+  }
+  catch (const rclcpp_action::exceptions::UnknownGoalHandleError &)
+  {
+  }
+}
+}  // namespace
+
 MoveBaseAction::MoveBaseAction(const rclcpp::Node::SharedPtr &node, const std::string& name,
                                const mbf_utility::RobotInformation::ConstPtr& robot_info, const std::vector<std::string>& available_recovery_behaviors)
   : name_(name)
@@ -144,11 +162,35 @@ rcl_interfaces::msg::SetParametersResult MoveBaseAction::reconfigure(const std::
 
 void MoveBaseAction::cancel()
 {
+  std::lock_guard<std::mutex> guard(child_goals_mtx_);
   action_state_ = CANCELED;
 
-  action_client_get_path_->async_cancel_all_goals();
-  action_client_exe_path_->async_cancel_all_goals();
-  action_client_recovery_->async_cancel_all_goals();
+  cancelChildGoal(*action_client_get_path_, get_path_child_);
+  cancelChildGoal(*action_client_exe_path_, exe_path_child_);
+  cancelChildGoal(*action_client_recovery_, recovery_child_);
+}
+
+template<typename ActionT>
+void MoveBaseAction::adoptChildGoal(
+  rclcpp_action::Client<ActionT> & client,
+  const typename rclcpp_action::ClientGoalHandle<ActionT>::SharedPtr & goal_handle,
+  typename rclcpp_action::ClientGoalHandle<ActionT>::SharedPtr & child)
+{
+  std::lock_guard<std::mutex> guard(child_goals_mtx_);
+  child = goal_handle;
+  if (action_state_ == CANCELED)
+  {
+    cancelChildGoal(client, child);
+  }
+}
+
+template<typename ActionT>
+bool MoveBaseAction::isChildGoal(
+  const typename rclcpp_action::ClientGoalHandle<ActionT>::SharedPtr & child,
+  const rclcpp_action::GoalUUID & goal_id)
+{
+  std::lock_guard<std::mutex> guard(child_goals_mtx_);
+  return child && child->get_goal_id() == goal_id;
 }
 
 bool MoveBaseAction::checkAndHandleMoveBaseActionCanceled() {
@@ -165,6 +207,12 @@ bool MoveBaseAction::checkAndHandleMoveBaseActionCanceled() {
 
 void MoveBaseAction::start(std::shared_ptr<GoalHandle> goal_handle)
 {
+  {
+    std::lock_guard<std::mutex> guard(child_goals_mtx_);
+    get_path_child_.reset();
+    exe_path_child_.reset();
+    recovery_child_.reset();
+  }
   goal_handle_ = goal_handle;
   dist_to_goal_ = std::numeric_limits<double>::infinity();
   action_state_ = GET_PATH;
@@ -216,10 +264,11 @@ void MoveBaseAction::start(std::shared_ptr<GoalHandle> goal_handle)
   get_path_goal_handle_ = action_client_get_path_->async_send_goal(get_path_goal_, get_path_send_goal_options_);
 }
 
-void MoveBaseAction::actionExePathGoalResponse(const rclcpp_action::ClientGoalHandle<ExePath>::ConstSharedPtr& exe_path_goal_handle)
+void MoveBaseAction::actionExePathGoalResponse(const rclcpp_action::ClientGoalHandle<ExePath>::SharedPtr& exe_path_goal_handle)
 {
   if (exe_path_goal_handle) {
     RCLCPP_DEBUG_STREAM(rclcpp::get_logger("move_base"), "The \"exe_path\" action goal (stamp " << exe_path_goal_handle->get_goal_stamp().seconds() << ") has been accepted.");
+    adoptChildGoal(*action_client_exe_path_, exe_path_goal_handle, exe_path_child_);
   } else {
     RCLCPP_ERROR(rclcpp::get_logger("move_base"), "The last action goal to \"exe_path\" has been rejected");
     action_state_ = FAILED;
@@ -228,6 +277,9 @@ void MoveBaseAction::actionExePathGoalResponse(const rclcpp_action::ClientGoalHa
 
 void MoveBaseAction::actionExePathFeedback(const rclcpp_action::ClientGoalHandle<ExePath>::ConstSharedPtr& goal_handle, const ExePath::Feedback::ConstSharedPtr &feedback)
 {
+  if (!isChildGoal<ExePath>(exe_path_child_, goal_handle->get_goal_id())) { return; }
+  if (!goal_handle_->is_active()) { return; }
+
   mbf_msgs::action::MoveBase::Feedback::SharedPtr move_base_feedback = std::make_shared<mbf_msgs::action::MoveBase::Feedback>();
   move_base_feedback->outcome = feedback->outcome;
   move_base_feedback->message = feedback->message;
@@ -287,11 +339,12 @@ void MoveBaseAction::actionExePathFeedback(const rclcpp_action::ClientGoalHandle
   }
 }
 
-void MoveBaseAction::actionGetPathGoalResponse(const rclcpp_action::ClientGoalHandle<GetPath>::ConstSharedPtr& get_path_goal_handle)
+void MoveBaseAction::actionGetPathGoalResponse(const rclcpp_action::ClientGoalHandle<GetPath>::SharedPtr& get_path_goal_handle)
 {
   if (get_path_goal_handle) 
   {
     RCLCPP_DEBUG_STREAM(rclcpp::get_logger("move_base"), "The \"get_path\" action goal (stamp " << get_path_goal_handle->get_goal_stamp().seconds() << ") has been accepted.");
+    adoptChildGoal(*action_client_get_path_, get_path_goal_handle, get_path_child_);
   }
   else 
   {
@@ -305,6 +358,8 @@ void MoveBaseAction::actionGetPathGoalResponse(const rclcpp_action::ClientGoalHa
 
 void MoveBaseAction::actionGetPathResult(const rclcpp_action::ClientGoalHandle<GetPath>::WrappedResult &result)
 {
+  if (!isChildGoal<GetPath>(get_path_child_, result.goal_id)) { return; }
+  if (!goal_handle_->is_active()) { return; }
   if(checkAndHandleMoveBaseActionCanceled()) { return; }
 
   const mbf_msgs::action::GetPath::Result::SharedPtr get_path_result_ptr = result.result;
@@ -376,6 +431,8 @@ void MoveBaseAction::actionGetPathResult(const rclcpp_action::ClientGoalHandle<G
 
 void MoveBaseAction::actionExePathResult(const rclcpp_action::ClientGoalHandle<ExePath>::WrappedResult &result)
 {
+  if (!isChildGoal<ExePath>(exe_path_child_, result.goal_id)) { return; }
+  if (!goal_handle_->is_active()) { return; }
   if(checkAndHandleMoveBaseActionCanceled()) { return; }
 
   RCLCPP_DEBUG_STREAM(rclcpp::get_logger("move_base"), "Action \"exe_path\" finished.");
@@ -475,10 +532,11 @@ bool MoveBaseAction::attemptRecovery()
   return true;
 }
 
-void MoveBaseAction::actionRecoveryGoalResponse(const rclcpp_action::ClientGoalHandle<Recovery>::ConstSharedPtr& recovery_goal_handle)
+void MoveBaseAction::actionRecoveryGoalResponse(const rclcpp_action::ClientGoalHandle<Recovery>::SharedPtr& recovery_goal_handle)
 {
   if (recovery_goal_handle) {
     RCLCPP_DEBUG_STREAM(rclcpp::get_logger("move_base"), "The \"recovery\" action goal (stamp " << recovery_goal_handle->get_goal_stamp().seconds() << ") has been accepted.");
+    adoptChildGoal(*action_client_recovery_, recovery_goal_handle, recovery_child_);
   } else {
     // recoveryRejectedOrAborted(); TODO gimme result?
   }
@@ -490,6 +548,8 @@ void MoveBaseAction::recoveryRejectedOrAborted(const rclcpp_action::ClientGoalHa
 
 void MoveBaseAction::actionRecoveryResult(const rclcpp_action::ClientGoalHandle<Recovery>::WrappedResult &result)
 {
+  if (!isChildGoal<Recovery>(recovery_child_, result.goal_id)) { return; }
+  if (!goal_handle_->is_active()) { return; }
   if(checkAndHandleMoveBaseActionCanceled()) { return; }
 
   // give the robot some time to stop oscillating after executing the recovery behavior

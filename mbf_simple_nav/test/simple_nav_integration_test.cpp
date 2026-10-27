@@ -1,3 +1,6 @@
+#include <atomic>
+#include <future>
+#include <memory>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <mbf_simple_nav/simple_navigation_server.h>
@@ -329,4 +332,36 @@ TEST_F(SimpleNavIntegrationTest, moveBaseActionReachesTheGoal)
   const auto & goal_position = move_base_goal.target_pose.pose.position;
   EXPECT_NEAR(robot_position.x, goal_position.x, 0.05);
   EXPECT_NEAR(robot_position.y, goal_position.y, 0.05);
+}
+
+TEST_F(SimpleNavIntegrationTest, moveBaseActionCancelsWhileExePathFeedbackIsInFlight)
+{
+  initRosNode(rclcpp::NodeOptions(default_node_options_).append_parameter_override("controller_frequency", 1000.0));
+  robot_sim_node_ptr_->set_parameter(rclcpp::Parameter("is_robot_stuck", true));
+
+  mbf_msgs::action::MoveBase::Goal move_base_goal;
+  move_base_goal.target_pose.header.frame_id = "odom";
+  move_base_goal.target_pose.pose.position.x = -3.2;
+  move_base_goal.target_pose.pose.position.y = 0.8;
+
+  for (int attempt = 0; attempt < 200; ++attempt) {
+    const auto feedback = std::make_shared<std::promise<void>>();
+    const auto got_feedback = std::make_shared<std::atomic<bool>>(false);
+    rclcpp_action::Client<mbf_msgs::action::MoveBase>::SendGoalOptions options;
+    options.feedback_callback = [feedback, got_feedback](auto, auto) {
+        if (!got_feedback->exchange(true)) {
+          feedback->set_value();
+        }
+      };
+    move_base_goal.target_pose.header.stamp = robot_sim_node_ptr_->now();
+    const auto goal_handle = action_client_move_base_ptr_->async_send_goal(move_base_goal, options);
+    ASSERT_TRUE(wait_until_future_complete(goal_handle));
+    ASSERT_THAT(goal_handle.get(), NotNull());
+    ASSERT_TRUE(wait_until_future_complete(feedback->get_future()));
+
+    const auto future_result = action_client_move_base_ptr_->async_get_result(goal_handle.get());
+    ASSERT_TRUE(wait_until_future_complete(action_client_move_base_ptr_->async_cancel_goal(goal_handle.get())));
+    ASSERT_TRUE(wait_until_future_complete(future_result));
+    EXPECT_EQ(future_result.get().code, rclcpp_action::ResultCode::CANCELED) << "attempt " << attempt;
+  }
 }
