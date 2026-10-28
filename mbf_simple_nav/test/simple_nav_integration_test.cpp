@@ -1,6 +1,10 @@
+#include <action_msgs/msg/goal_status_array.hpp>
 #include <atomic>
+#include <chrono>
 #include <future>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <mbf_simple_nav/simple_navigation_server.h>
@@ -364,4 +368,62 @@ TEST_F(SimpleNavIntegrationTest, moveBaseActionCancelsWhileExePathFeedbackIsInFl
     ASSERT_TRUE(wait_until_future_complete(future_result));
     EXPECT_EQ(future_result.get().code, rclcpp_action::ResultCode::CANCELED) << "attempt " << attempt;
   }
+}
+
+TEST_F(SimpleNavIntegrationTest, moveBaseActionReplansWhileExePathIsRunning)
+{
+  initRosNode(rclcpp::NodeOptions(default_node_options_).append_parameter_override("planner_frequency", 20.0));
+  robot_sim_node_ptr_->set_parameter(rclcpp::Parameter("is_robot_stuck", true));
+
+  struct SeenGoals
+  {
+    std::mutex mtx;
+    std::set<rclcpp_action::GoalUUID> get_path;
+    std::set<rclcpp_action::GoalUUID> exe_path;
+  };
+  const auto seen = std::make_shared<SeenGoals>();
+  const auto get_path_status_sub = robot_sim_node_ptr_->create_subscription<action_msgs::msg::GoalStatusArray>(
+    "/simple_nav/get_path/_action/status", 10, [seen](const action_msgs::msg::GoalStatusArray & msg) {
+      std::lock_guard<std::mutex> guard(seen->mtx);
+      for (const auto & status : msg.status_list) {
+        seen->get_path.insert(status.goal_info.goal_id.uuid);
+      }
+    });
+  const auto exe_path_status_sub = robot_sim_node_ptr_->create_subscription<action_msgs::msg::GoalStatusArray>(
+    "/simple_nav/exe_path/_action/status", 10, [seen](const action_msgs::msg::GoalStatusArray & msg) {
+      std::lock_guard<std::mutex> guard(seen->mtx);
+      for (const auto & status : msg.status_list) {
+        seen->exe_path.insert(status.goal_info.goal_id.uuid);
+      }
+    });
+
+  mbf_msgs::action::MoveBase::Goal move_base_goal;
+  move_base_goal.target_pose.header.frame_id = "odom";
+  move_base_goal.target_pose.header.stamp = robot_sim_node_ptr_->now();
+  move_base_goal.target_pose.pose.position.x = -3.2;
+  move_base_goal.target_pose.pose.position.y = 0.8;
+  const auto goal_handle = action_client_move_base_ptr_->async_send_goal(move_base_goal);
+  ASSERT_TRUE(wait_until_future_complete(goal_handle));
+  ASSERT_THAT(goal_handle.get(), NotNull());
+  const auto future_result = action_client_move_base_ptr_->async_get_result(goal_handle.get());
+
+  size_t get_path_goals = 0;
+  size_t exe_path_goals = 0;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (std::chrono::steady_clock::now() < deadline &&
+    future_result.wait_for(std::chrono::milliseconds(10)) != std::future_status::ready)
+  {
+    std::lock_guard<std::mutex> guard(seen->mtx);
+    get_path_goals = seen->get_path.size();
+    exe_path_goals = seen->exe_path.size();
+    if (get_path_goals >= 4 && exe_path_goals >= 3) {
+      break;
+    }
+  }
+  EXPECT_GE(get_path_goals, 4u);
+  EXPECT_GE(exe_path_goals, 3u);
+
+  ASSERT_TRUE(wait_until_future_complete(action_client_move_base_ptr_->async_cancel_goal(goal_handle.get())));
+  ASSERT_TRUE(wait_until_future_complete(future_result));
+  EXPECT_EQ(future_result.get().code, rclcpp_action::ResultCode::CANCELED);
 }

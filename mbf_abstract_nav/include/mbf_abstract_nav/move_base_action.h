@@ -101,6 +101,13 @@ protected:
     const rclcpp_action::ClientGoalHandle<GetPath>::SharedPtr & get_path_goal_handle);
   void actionGetPathResult(const rclcpp_action::ClientGoalHandle<GetPath>::WrappedResult & result);
 
+  void actionReplanningGoalResponse(
+    const std::shared_ptr<GoalHandle> & move_base_goal_handle,
+    const rclcpp_action::ClientGoalHandle<GetPath>::SharedPtr & get_path_goal_handle);
+  void actionReplanningResult(
+    const std::shared_ptr<GoalHandle> & move_base_goal_handle,
+    const rclcpp_action::ClientGoalHandle<GetPath>::WrappedResult & result);
+
   void actionExePathGoalResponse(
     const rclcpp_action::ClientGoalHandle<ExePath>::SharedPtr & exe_path_goal_handle);
   void actionExePathFeedback(
@@ -136,7 +143,7 @@ protected:
 
   bool replanningActive() const;
 
-  void replanningThread();
+  void replan();
 
   /**
    * Utility method that fills move base action result with the result of any of the action clients.
@@ -163,7 +170,6 @@ protected:
   ExePath::Goal exe_path_goal_;
   rclcpp_action::Client<ExePath>::SendGoalOptions exe_path_send_goal_options_;
   GetPath::Goal get_path_goal_;
-  std::shared_future<rclcpp_action::ClientGoalHandle<GetPath>::SharedPtr> get_path_goal_handle_;
   rclcpp_action::Client<GetPath>::SendGoalOptions get_path_send_goal_options_;
   Recovery::Goal recovery_goal_;
   rclcpp_action::Client<Recovery>::SendGoalOptions recovery_send_goal_options_;
@@ -216,9 +222,14 @@ protected:
   //! Replanning period dynamically reconfigurable
   rclcpp::Duration replanning_period_;
 
-  //! Replanning thread, running permanently
-  std::thread replanning_thread_;
-  bool replanning_thread_shutdown_;
+  //! Replanning timer, running at planner_frequency if it is positive
+  rclcpp::TimerBase::SharedPtr replanning_timer_;
+
+  //! true, while a replanning get_path goal is in flight
+  bool replanning_;
+
+  //! true, while an exe_path goal awaits its goal response
+  bool exe_path_pending_;
 
   //! true, if recovery behavior for the MoveBase action is enabled.
   bool recovery_enabled_;

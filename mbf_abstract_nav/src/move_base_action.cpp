@@ -73,7 +73,7 @@ namespace
 template<typename ActionT>
 void cancelChildGoal(
   rclcpp_action::Client<ActionT> & client,
-  typename rclcpp_action::ClientGoalHandle<ActionT>::SharedPtr & child)
+  const typename rclcpp_action::ClientGoalHandle<ActionT>::SharedPtr & child)
 {
   if (!child) { return; }
   try
@@ -93,13 +93,13 @@ MoveBaseAction::MoveBaseAction(const rclcpp::Node::SharedPtr &node, const std::s
   , node_(node)
   , oscillation_timeout_(0, 0)
   , oscillation_distance_(0)
-  , replanning_thread_shutdown_(false)
   , available_recovery_behaviors_(available_recovery_behaviors)
   , action_state_(NONE)
   , recovery_trigger_(NONE)
   , dist_to_goal_(std::numeric_limits<double>::infinity())
   , replanning_period_(0, 0)
-  , replanning_thread_(std::bind(&MoveBaseAction::replanningThread, this))
+  , replanning_(false)
+  , exe_path_pending_(false)
 { 
   recovery_enabled_ = node_->declare_parameter("recovery_enabled", true);
 
@@ -122,10 +122,9 @@ MoveBaseAction::MoveBaseAction(const rclcpp::Node::SharedPtr &node, const std::s
 MoveBaseAction::~MoveBaseAction()
 {
   action_state_ = NONE;
-  replanning_thread_shutdown_ = true;
-  if (replanning_thread_.joinable())
+  if (replanning_timer_)
   {
-    replanning_thread_.join();
+    replanning_timer_->cancel();
   }
 }
 
@@ -142,6 +141,17 @@ rcl_interfaces::msg::SetParametersResult MoveBaseAction::reconfigure(const std::
         replanning_period_ = rclcpp::Duration::from_seconds(1.0 / new_planner_frequency);
       else
         replanning_period_ = rclcpp::Duration::from_seconds(0.0);
+
+      if (replanning_timer_)
+      {
+        replanning_timer_->cancel();
+        replanning_timer_.reset();
+      }
+      if (replanning_period_.seconds() > 0.0)
+      {
+        replanning_timer_ = rclcpp::create_timer(
+          node_, node_->get_clock(), replanning_period_, std::bind(&MoveBaseAction::replan, this));
+      }
     }
     else if (param_name == "oscillation_timeout") 
     {
@@ -216,6 +226,7 @@ void MoveBaseAction::start(std::shared_ptr<GoalHandle> goal_handle)
   goal_handle_ = goal_handle;
   dist_to_goal_ = std::numeric_limits<double>::infinity();
   action_state_ = GET_PATH;
+  replanning_ = false;
   RCLCPP_DEBUG_STREAM(rclcpp::get_logger("move_base"), "Start action \"move_base\"");
 
   if (checkAndHandleMoveBaseActionCanceled()) { return; }
@@ -261,11 +272,12 @@ void MoveBaseAction::start(std::shared_ptr<GoalHandle> goal_handle)
   }
 
   // call get_path action server to get a first plan
-  get_path_goal_handle_ = action_client_get_path_->async_send_goal(get_path_goal_, get_path_send_goal_options_);
+  action_client_get_path_->async_send_goal(get_path_goal_, get_path_send_goal_options_);
 }
 
 void MoveBaseAction::actionExePathGoalResponse(const rclcpp_action::ClientGoalHandle<ExePath>::SharedPtr& exe_path_goal_handle)
 {
+  exe_path_pending_ = false;
   if (exe_path_goal_handle) {
     RCLCPP_DEBUG_STREAM(rclcpp::get_logger("move_base"), "The \"exe_path\" action goal (stamp " << exe_path_goal_handle->get_goal_stamp().seconds() << ") has been accepted.");
     adoptChildGoal(*action_client_exe_path_, exe_path_goal_handle, exe_path_child_);
@@ -386,6 +398,7 @@ void MoveBaseAction::actionGetPathResult(const rclcpp_action::ClientGoalHandle<G
         recovery_trigger_ = NONE;
       }
       
+      exe_path_pending_ = true;
       action_client_exe_path_->async_send_goal(exe_path_goal_, exe_path_send_goal_options_);
           
       action_state_ = EXE_PATH;
@@ -432,6 +445,7 @@ void MoveBaseAction::actionGetPathResult(const rclcpp_action::ClientGoalHandle<G
 void MoveBaseAction::actionExePathResult(const rclcpp_action::ClientGoalHandle<ExePath>::WrappedResult &result)
 {
   if (!isChildGoal<ExePath>(exe_path_child_, result.goal_id)) { return; }
+  if (exe_path_pending_) { return; }
   if (!goal_handle_->is_active()) { return; }
   if(checkAndHandleMoveBaseActionCanceled()) { return; }
 
@@ -596,7 +610,7 @@ void MoveBaseAction::actionRecoveryResult(const rclcpp_action::ClientGoalHandle<
                              "Try planning again and increment the current recovery behavior in the list.");
       action_state_ = GET_PATH;
       current_recovery_behavior_++; // use next behavior, the next time;
-      get_path_goal_handle_ = action_client_get_path_->async_send_goal(get_path_goal_, get_path_send_goal_options_);
+      action_client_get_path_->async_send_goal(get_path_goal_, get_path_send_goal_options_);
       break;
     case rclcpp_action::ResultCode::CANCELED:
       RCLCPP_INFO_STREAM(rclcpp::get_logger("move_base"), "The last action goal to \"recovery\" has been canceled!");
@@ -622,46 +636,60 @@ bool MoveBaseAction::replanningActive() const
   return replanning_period_.seconds() > 0.0 && action_state_ == EXE_PATH && dist_to_goal_ > 0.1;
 }
 
-void MoveBaseAction::replanningThread()
+void MoveBaseAction::replan()
 {
-  const auto update_preiod = std::chrono::milliseconds(5);
-  rclcpp::Time last_replan_time(0, 0, node_->get_clock()->get_clock_type());
-
-  while (rclcpp::ok() && !replanning_thread_shutdown_ && get_path_goal_handle_.valid())
+  if (replanning_ || !replanningActive())
   {
-    get_path_goal_handle_.wait(); // TODO maybe use wait_for and fail gracefully if the future does not return in time?
-    const auto get_path_goal_handle = get_path_goal_handle_.get();
-    if (get_path_goal_handle->get_status() == rclcpp_action::GoalStatus::STATUS_ACCEPTED || get_path_goal_handle->get_status() == rclcpp_action::GoalStatus::STATUS_EXECUTING)
-    {
-      const auto get_path_result_future = action_client_get_path_->async_get_result(get_path_goal_handle);
-      if (get_path_result_future.wait_for(update_preiod) == std::future_status::ready)
-      {
-        const auto get_path_result = get_path_result_future.get();
-        if (get_path_result.code == rclcpp_action::ResultCode::SUCCEEDED && replanningActive())
-        {
-          RCLCPP_DEBUG_STREAM(rclcpp::get_logger("move_base"), "Replanning succeeded; sending a goal to \"exe_path\" with the new plan");
-          exe_path_goal_.path = get_path_result.result->path;
-          mbf_msgs::action::ExePath::Goal exe_path_goal = exe_path_goal_;
-          action_client_exe_path_->async_send_goal(exe_path_goal, exe_path_send_goal_options_);
-        }
-        else
-        {
-          RCLCPP_DEBUG_STREAM(rclcpp::get_logger("move_base"),
-                                 "Replanning failed with error code " << get_path_result.result->outcome << ": " << get_path_result.result->message);
-        }
-      }
-      // else keep waiting for planning to complete (we already waited update_period in waitForResult)
-    }
-    else if (!replanningActive())
-    {
-      rclcpp::sleep_for(update_preiod);
-    }
-    else if (node_->now() - last_replan_time >= replanning_period_)
-    {
-      RCLCPP_DEBUG_STREAM(rclcpp::get_logger("move_base"), "Next replanning cycle, using the \"get_path\" action!");
-      get_path_goal_handle_ = action_client_get_path_->async_send_goal(get_path_goal_); // TODO no callbacks needed?
-      last_replan_time = node_->now();
-    }
+    return;
+  }
+
+  RCLCPP_DEBUG_STREAM(rclcpp::get_logger("move_base"), "Next replanning cycle, using the \"get_path\" action!");
+  replanning_ = true;
+  rclcpp_action::Client<GetPath>::SendGoalOptions options;
+  options.goal_response_callback = std::bind(&MoveBaseAction::actionReplanningGoalResponse, this, goal_handle_, _1);
+  options.result_callback = std::bind(&MoveBaseAction::actionReplanningResult, this, goal_handle_, _1);
+  action_client_get_path_->async_send_goal(get_path_goal_, options);
+}
+
+void MoveBaseAction::actionReplanningGoalResponse(
+  const std::shared_ptr<GoalHandle>& move_base_goal_handle,
+  const rclcpp_action::ClientGoalHandle<GetPath>::SharedPtr& get_path_goal_handle)
+{
+  if (move_base_goal_handle != goal_handle_)
+  {
+    cancelChildGoal(*action_client_get_path_, get_path_goal_handle);
+    return;
+  }
+  if (!get_path_goal_handle)
+  {
+    RCLCPP_WARN(rclcpp::get_logger("move_base"), "The replanning goal to \"get_path\" has been rejected");
+    replanning_ = false;
+    return;
+  }
+  adoptChildGoal(*action_client_get_path_, get_path_goal_handle, get_path_child_);
+}
+
+void MoveBaseAction::actionReplanningResult(
+  const std::shared_ptr<GoalHandle>& move_base_goal_handle,
+  const rclcpp_action::ClientGoalHandle<GetPath>::WrappedResult& result)
+{
+  if (move_base_goal_handle != goal_handle_) { return; }
+  replanning_ = false;
+  if (!isChildGoal<GetPath>(get_path_child_, result.goal_id)) { return; }
+  if (!goal_handle_->is_active()) { return; }
+  if (checkAndHandleMoveBaseActionCanceled()) { return; }
+
+  if (result.code == rclcpp_action::ResultCode::SUCCEEDED && replanningActive())
+  {
+    RCLCPP_DEBUG_STREAM(rclcpp::get_logger("move_base"), "Replanning succeeded; sending a goal to \"exe_path\" with the new plan");
+    exe_path_goal_.path = result.result->path;
+    exe_path_pending_ = true;
+    action_client_exe_path_->async_send_goal(exe_path_goal_, exe_path_send_goal_options_);
+  }
+  else
+  {
+    RCLCPP_DEBUG_STREAM(rclcpp::get_logger("move_base"),
+                           "Replanning failed with error code " << result.result->outcome << ": " << result.result->message);
   }
 }
 
