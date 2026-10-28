@@ -140,6 +140,13 @@ public:
       RCLCPP_INFO(node_->get_logger(), "Goal canceled before execution started.");
     } else {
       std::lock_guard<std::mutex> guard(slot_map_mtx_);
+      if (stopped_) {
+        typename Action::Result::SharedPtr result = std::make_shared<typename Action::Result>();
+        result->outcome = Action::Result::CANCELED;
+        result->message = "Action server has been stopped";
+        goal_handle->abort(result);
+        return;
+      }
       typename ConcurrencyMap::iterator slot_it = concurrency_slots_.find(slot_id);
       if (slot_it != concurrency_slots_.end()) {
         if (slot_it->second.in_use) {
@@ -199,6 +206,16 @@ public:
     slot.in_use = false;
   }
 
+  //! Cancels all running goals and aborts the goals started afterwards.
+  virtual void stop()
+  {
+    {
+      std::lock_guard<std::mutex> guard(slot_map_mtx_);
+      stopped_ = true;
+    }
+    cancelAll();
+  }
+
   virtual void cancelAll()
   {
     RCLCPP_INFO_STREAM(rclcpp::get_logger(name_), "Cancel all goals for \"" << name_ << "\".");
@@ -219,6 +236,8 @@ protected:
   ConcurrencyMap concurrency_slots_;
 
   std::mutex slot_map_mtx_;
+
+  bool stopped_ = false;
 
 };
 

@@ -40,6 +40,7 @@
 #ifndef MBF_ABSTRACT_NAV__MOVE_BASE_ACTION_H_
 #define MBF_ABSTRACT_NAV__MOVE_BASE_ACTION_H_
 
+#include <memory>
 #include <mutex>
 #include <thread>
 
@@ -70,7 +71,7 @@ const std::string name_action_recovery = "~/recovery";
 //! MoveBase action topic name
 const std::string name_action_move_base = "~/move_base";
 
-class MoveBaseAction
+class MoveBaseAction : public std::enable_shared_from_this<MoveBaseAction>
 {
 public:
   typedef std::shared_ptr<MoveBaseAction> Ptr;
@@ -92,6 +93,9 @@ public:
   void start(std::shared_ptr<GoalHandle> goal_handle);
 
   void cancel();
+
+  //! Aborts the active MoveBase goal and the goals started afterwards.
+  void stop();
 
   rcl_interfaces::msg::SetParametersResult reconfigure(
     const std::vector<rclcpp::Parameter> & parameters);
@@ -127,6 +131,8 @@ protected:
   bool checkAndHandleMoveBaseActionCanceled();
 
   bool attemptRecovery();
+
+  void abortStopped(const std::shared_ptr<GoalHandle> & goal_handle);
 
   //! Keeps an accepted child goal of the active MoveBase goal, or cancels it right away if that goal is canceled.
   template<typename ActionT>
@@ -173,6 +179,12 @@ protected:
   rclcpp_action::Client<GetPath>::SendGoalOptions get_path_send_goal_options_;
   Recovery::Goal recovery_goal_;
   rclcpp_action::Client<Recovery>::SendGoalOptions recovery_send_goal_options_;
+
+  //! serializes the callbacks of the active MoveBase action goal with stop()
+  std::recursive_mutex goal_mtx_;
+
+  //! true, once stop() has been called
+  bool stopped_ = false;
 
   //! child goals of the active MoveBase action goal, canceled together with it
   std::mutex child_goals_mtx_;

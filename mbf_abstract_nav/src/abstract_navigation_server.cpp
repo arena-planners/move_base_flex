@@ -430,11 +430,11 @@ mbf_abstract_nav::AbstractRecoveryExecution::Ptr AbstractNavigationServer::newRe
 
 void AbstractNavigationServer::stop()
 {
-  planner_action_->cancelAll();
-  plan_refiner_action_->cancelAll();
-  controller_action_->cancelAll();
-  recovery_action_->cancelAll();
-  move_base_action_->cancel();
+  move_base_action_->stop();
+  planner_action_->stop();
+  plan_refiner_action_->stop();
+  controller_action_->stop();
+  recovery_action_->stop();
 }
 
 } /* namespace mbf_abstract_nav */

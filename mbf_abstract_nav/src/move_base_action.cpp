@@ -149,8 +149,14 @@ rcl_interfaces::msg::SetParametersResult MoveBaseAction::reconfigure(const std::
       }
       if (replanning_period_.seconds() > 0.0)
       {
+        const std::weak_ptr<MoveBaseAction> weak_this = weak_from_this();
         replanning_timer_ = rclcpp::create_timer(
-          node_, node_->get_clock(), replanning_period_, std::bind(&MoveBaseAction::replan, this));
+          node_, node_->get_clock(), replanning_period_, [weak_this]() {
+            if (const auto self = weak_this.lock())
+            {
+              self->replan();
+            }
+          });
       }
     }
     else if (param_name == "oscillation_timeout") 
@@ -178,6 +184,25 @@ void MoveBaseAction::cancel()
   cancelChildGoal(*action_client_get_path_, get_path_child_);
   cancelChildGoal(*action_client_exe_path_, exe_path_child_);
   cancelChildGoal(*action_client_recovery_, recovery_child_);
+}
+
+void MoveBaseAction::stop()
+{
+  std::lock_guard<std::recursive_mutex> goal_guard(goal_mtx_);
+  stopped_ = true;
+  action_state_ = NONE;
+  if (!goal_handle_ || !goal_handle_->is_active()) { return; }
+  abortStopped(goal_handle_);
+}
+
+void MoveBaseAction::abortStopped(const std::shared_ptr<GoalHandle> & goal_handle)
+{
+  mbf_msgs::action::MoveBase::Result stopped;
+  stopped.outcome = mbf_msgs::action::MoveBase::Result::CANCELED;
+  stopped.message = "move_base stopped by the navigation server";
+  mbf_msgs::action::MoveBase::Result::SharedPtr move_base_result = std::make_shared<mbf_msgs::action::MoveBase::Result>();
+  fillMoveBaseResult(stopped, *move_base_result);
+  goal_handle->abort(move_base_result);
 }
 
 template<typename ActionT>
@@ -217,6 +242,12 @@ bool MoveBaseAction::checkAndHandleMoveBaseActionCanceled() {
 
 void MoveBaseAction::start(std::shared_ptr<GoalHandle> goal_handle)
 {
+  std::lock_guard<std::recursive_mutex> goal_guard(goal_mtx_);
+  if (stopped_)
+  {
+    abortStopped(goal_handle);
+    return;
+  }
   {
     std::lock_guard<std::mutex> guard(child_goals_mtx_);
     get_path_child_.reset();
@@ -277,6 +308,7 @@ void MoveBaseAction::start(std::shared_ptr<GoalHandle> goal_handle)
 
 void MoveBaseAction::actionExePathGoalResponse(const rclcpp_action::ClientGoalHandle<ExePath>::SharedPtr& exe_path_goal_handle)
 {
+  std::lock_guard<std::recursive_mutex> goal_guard(goal_mtx_);
   exe_path_pending_ = false;
   if (exe_path_goal_handle) {
     RCLCPP_DEBUG_STREAM(rclcpp::get_logger("move_base"), "The \"exe_path\" action goal (stamp " << exe_path_goal_handle->get_goal_stamp().seconds() << ") has been accepted.");
@@ -302,6 +334,7 @@ void MoveBaseAction::actionExePathGoalResponse(const rclcpp_action::ClientGoalHa
 
 void MoveBaseAction::actionExePathFeedback(const rclcpp_action::ClientGoalHandle<ExePath>::ConstSharedPtr& goal_handle, const ExePath::Feedback::ConstSharedPtr &feedback)
 {
+  std::lock_guard<std::recursive_mutex> goal_guard(goal_mtx_);
   if (!isChildGoal<ExePath>(exe_path_child_, goal_handle->get_goal_id())) { return; }
   if (!goal_handle_->is_active()) { return; }
 
@@ -366,6 +399,7 @@ void MoveBaseAction::actionExePathFeedback(const rclcpp_action::ClientGoalHandle
 
 void MoveBaseAction::actionGetPathGoalResponse(const rclcpp_action::ClientGoalHandle<GetPath>::SharedPtr& get_path_goal_handle)
 {
+  std::lock_guard<std::recursive_mutex> goal_guard(goal_mtx_);
   if (get_path_goal_handle) 
   {
     RCLCPP_DEBUG_STREAM(rclcpp::get_logger("move_base"), "The \"get_path\" action goal (stamp " << get_path_goal_handle->get_goal_stamp().seconds() << ") has been accepted.");
@@ -383,6 +417,7 @@ void MoveBaseAction::actionGetPathGoalResponse(const rclcpp_action::ClientGoalHa
 
 void MoveBaseAction::actionGetPathResult(const rclcpp_action::ClientGoalHandle<GetPath>::WrappedResult &result)
 {
+  std::lock_guard<std::recursive_mutex> goal_guard(goal_mtx_);
   if (!isChildGoal<GetPath>(get_path_child_, result.goal_id)) { return; }
   if (!goal_handle_->is_active()) { return; }
   if(checkAndHandleMoveBaseActionCanceled()) { return; }
@@ -457,6 +492,7 @@ void MoveBaseAction::actionGetPathResult(const rclcpp_action::ClientGoalHandle<G
 
 void MoveBaseAction::actionExePathResult(const rclcpp_action::ClientGoalHandle<ExePath>::WrappedResult &result)
 {
+  std::lock_guard<std::recursive_mutex> goal_guard(goal_mtx_);
   if (!isChildGoal<ExePath>(exe_path_child_, result.goal_id)) { return; }
   if (exe_path_pending_) { return; }
   if (!goal_handle_->is_active()) { return; }
@@ -561,6 +597,7 @@ bool MoveBaseAction::attemptRecovery()
 
 void MoveBaseAction::actionRecoveryGoalResponse(const rclcpp_action::ClientGoalHandle<Recovery>::SharedPtr& recovery_goal_handle)
 {
+  std::lock_guard<std::recursive_mutex> goal_guard(goal_mtx_);
   if (recovery_goal_handle) {
     RCLCPP_DEBUG_STREAM(rclcpp::get_logger("move_base"), "The \"recovery\" action goal (stamp " << recovery_goal_handle->get_goal_stamp().seconds() << ") has been accepted.");
     adoptChildGoal(*action_client_recovery_, recovery_goal_handle, recovery_child_);
@@ -575,6 +612,7 @@ void MoveBaseAction::recoveryRejectedOrAborted(const rclcpp_action::ClientGoalHa
 
 void MoveBaseAction::actionRecoveryResult(const rclcpp_action::ClientGoalHandle<Recovery>::WrappedResult &result)
 {
+  std::lock_guard<std::recursive_mutex> goal_guard(goal_mtx_);
   if (!isChildGoal<Recovery>(recovery_child_, result.goal_id)) { return; }
   if (!goal_handle_->is_active()) { return; }
   if(checkAndHandleMoveBaseActionCanceled()) { return; }
@@ -651,6 +689,7 @@ bool MoveBaseAction::replanningActive() const
 
 void MoveBaseAction::replan()
 {
+  std::lock_guard<std::recursive_mutex> goal_guard(goal_mtx_);
   if (replanning_ || !replanningActive())
   {
     return;
@@ -668,6 +707,7 @@ void MoveBaseAction::actionReplanningGoalResponse(
   const std::shared_ptr<GoalHandle>& move_base_goal_handle,
   const rclcpp_action::ClientGoalHandle<GetPath>::SharedPtr& get_path_goal_handle)
 {
+  std::lock_guard<std::recursive_mutex> goal_guard(goal_mtx_);
   if (move_base_goal_handle != goal_handle_)
   {
     cancelChildGoal(*action_client_get_path_, get_path_goal_handle);
@@ -686,6 +726,7 @@ void MoveBaseAction::actionReplanningResult(
   const std::shared_ptr<GoalHandle>& move_base_goal_handle,
   const rclcpp_action::ClientGoalHandle<GetPath>::WrappedResult& result)
 {
+  std::lock_guard<std::recursive_mutex> goal_guard(goal_mtx_);
   if (move_base_goal_handle != goal_handle_) { return; }
   replanning_ = false;
   if (!isChildGoal<GetPath>(get_path_child_, result.goal_id)) { return; }

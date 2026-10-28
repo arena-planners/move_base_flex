@@ -446,3 +446,52 @@ TEST_F(SimpleNavIntegrationTest, moveBaseActionAbortsWhenExePathRejectsTheContro
   EXPECT_EQ(future_result.get().code, rclcpp_action::ResultCode::ABORTED);
   EXPECT_EQ(future_result.get().result->outcome, mbf_msgs::action::ExePath::Result::INVALID_PLUGIN);
 }
+
+TEST_F(SimpleNavIntegrationTest, moveBaseActionAbortsWhenTheServerStops)
+{
+  initRosNode(default_node_options_);
+  robot_sim_node_ptr_->set_parameter(rclcpp::Parameter("is_robot_stuck", true));
+
+  mbf_msgs::action::MoveBase::Goal move_base_goal;
+  move_base_goal.target_pose.header.frame_id = "odom";
+  move_base_goal.target_pose.header.stamp = robot_sim_node_ptr_->now();
+  move_base_goal.target_pose.pose.position.x = -3.2;
+  move_base_goal.target_pose.pose.position.y = 0.8;
+  const auto feedback = std::make_shared<std::promise<void>>();
+  const auto got_feedback = std::make_shared<std::atomic<bool>>(false);
+  rclcpp_action::Client<mbf_msgs::action::MoveBase>::SendGoalOptions options;
+  options.feedback_callback = [feedback, got_feedback](auto, auto) {
+      if (!got_feedback->exchange(true)) {
+        feedback->set_value();
+      }
+    };
+  const auto goal_handle = action_client_move_base_ptr_->async_send_goal(move_base_goal, options);
+  ASSERT_TRUE(wait_until_future_complete(goal_handle));
+  ASSERT_THAT(goal_handle.get(), NotNull());
+  ASSERT_TRUE(wait_until_future_complete(feedback->get_future()));
+  const auto future_result = action_client_move_base_ptr_->async_get_result(goal_handle.get());
+
+  nav_server_ptr_->stop();
+
+  ASSERT_TRUE(wait_until_future_complete(future_result));
+  EXPECT_EQ(future_result.get().code, rclcpp_action::ResultCode::ABORTED);
+  EXPECT_EQ(future_result.get().result->outcome, mbf_msgs::action::MoveBase::Result::CANCELED);
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  EXPECT_TRUE(robot_sim_node_ptr_->get_parameter("is_robot_stuck").as_bool());
+
+  const auto late_move_base_goal = action_client_move_base_ptr_->async_send_goal(move_base_goal);
+  ASSERT_TRUE(wait_until_future_complete(late_move_base_goal));
+  ASSERT_THAT(late_move_base_goal.get(), NotNull());
+  const auto late_move_base_result = action_client_move_base_ptr_->async_get_result(late_move_base_goal.get());
+  ASSERT_TRUE(wait_until_future_complete(late_move_base_result));
+  EXPECT_EQ(late_move_base_result.get().code, rclcpp_action::ResultCode::ABORTED);
+  EXPECT_EQ(late_move_base_result.get().result->outcome, mbf_msgs::action::MoveBase::Result::CANCELED);
+
+  const auto late_exe_path_goal = action_client_exe_path_ptr_->async_send_goal(exe_path_goal_);
+  ASSERT_TRUE(wait_until_future_complete(late_exe_path_goal));
+  ASSERT_THAT(late_exe_path_goal.get(), NotNull());
+  const auto late_exe_path_result = action_client_exe_path_ptr_->async_get_result(late_exe_path_goal.get());
+  ASSERT_TRUE(wait_until_future_complete(late_exe_path_result));
+  EXPECT_EQ(late_exe_path_result.get().code, rclcpp_action::ResultCode::ABORTED);
+  EXPECT_EQ(late_exe_path_result.get().result->outcome, mbf_msgs::action::ExePath::Result::CANCELED);
+}
