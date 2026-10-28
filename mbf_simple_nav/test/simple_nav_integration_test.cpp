@@ -427,3 +427,22 @@ TEST_F(SimpleNavIntegrationTest, moveBaseActionReplansWhileExePathIsRunning)
   ASSERT_TRUE(wait_until_future_complete(future_result));
   EXPECT_EQ(future_result.get().code, rclcpp_action::ResultCode::CANCELED);
 }
+
+TEST_F(SimpleNavIntegrationTest, moveBaseActionAbortsWhenExePathRejectsTheController)
+{
+  initRosNode(default_node_options_);
+
+  mbf_msgs::action::MoveBase::Goal move_base_goal;
+  move_base_goal.controller = "unknown_controller";
+  move_base_goal.target_pose.header.frame_id = "odom";
+  move_base_goal.target_pose.header.stamp = robot_sim_node_ptr_->now();
+  move_base_goal.target_pose.pose.position.x = -3.2;
+  move_base_goal.target_pose.pose.position.y = 0.8;
+  const auto goal_handle = action_client_move_base_ptr_->async_send_goal(move_base_goal);
+  ASSERT_TRUE(wait_until_future_complete(goal_handle));
+  ASSERT_THAT(goal_handle.get(), NotNull());
+  const auto future_result = action_client_move_base_ptr_->async_get_result(goal_handle.get());
+  ASSERT_TRUE(wait_until_future_complete(future_result));
+  EXPECT_EQ(future_result.get().code, rclcpp_action::ResultCode::ABORTED);
+  EXPECT_EQ(future_result.get().result->outcome, mbf_msgs::action::ExePath::Result::INVALID_PLUGIN);
+}

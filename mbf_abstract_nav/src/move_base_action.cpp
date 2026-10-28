@@ -284,6 +284,19 @@ void MoveBaseAction::actionExePathGoalResponse(const rclcpp_action::ClientGoalHa
   } else {
     RCLCPP_ERROR(rclcpp::get_logger("move_base"), "The last action goal to \"exe_path\" has been rejected");
     action_state_ = FAILED;
+    if (!goal_handle_->is_active()) { return; }
+    if (checkAndHandleMoveBaseActionCanceled()) { return; }
+    {
+      std::lock_guard<std::mutex> guard(child_goals_mtx_);
+      cancelChildGoal(*action_client_get_path_, get_path_child_);
+      cancelChildGoal(*action_client_exe_path_, exe_path_child_);
+    }
+    mbf_msgs::action::ExePath::Result exe_path_result;
+    exe_path_result.outcome = mbf_msgs::action::ExePath::Result::INVALID_PLUGIN;
+    exe_path_result.message = "exe_path rejected the goal for controller \"" + exe_path_goal_.controller + "\"";
+    mbf_msgs::action::MoveBase::Result::SharedPtr move_base_result = std::make_shared<mbf_msgs::action::MoveBase::Result>();
+    fillMoveBaseResult(exe_path_result, *move_base_result);
+    goal_handle_->abort(move_base_result);
   }
 }
 
